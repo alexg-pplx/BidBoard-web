@@ -175,6 +175,10 @@ export default function App() {
   const [showAcceptConfirm, setShowAcceptConfirm] = useState<string | null>(null); // project id awaiting confirmation
   const [projectAddress, setProjectAddress] = useState(""); // address input for job creation
 
+  // ── Kanban drag-and-drop state ──────────────────────────────────────
+  const [draggedProjectId, setDraggedProjectId] = useState<string | null>(null);
+  const [dragOverColumn, setDragOverColumn] = useState<BidStatus | null>(null);
+
   useEffect(() => {
     async function loadSession() {
       const { data, error } = await supabase.auth.getSession();
@@ -841,6 +845,50 @@ export default function App() {
     window.print();
   }
 
+  // ── Kanban drag-and-drop handlers ────────────────────────────────────────
+
+  function handleDragStart(e: React.DragEvent, projectId: string) {
+    setDraggedProjectId(projectId);
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", projectId);
+  }
+
+  function handleDragEnd() {
+    setDraggedProjectId(null);
+    setDragOverColumn(null);
+  }
+
+  function handleColumnDragOver(e: React.DragEvent, status: BidStatus) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDragOverColumn(status);
+  }
+
+  function handleColumnDragLeave() {
+    setDragOverColumn(null);
+  }
+
+  function handleColumnDrop(e: React.DragEvent, targetStatus: BidStatus) {
+    e.preventDefault();
+    setDragOverColumn(null);
+
+    const projectId = draggedProjectId || e.dataTransfer.getData("text/plain");
+    if (!projectId) return;
+
+    const project = projects.find((p) => p.id === projectId);
+    if (!project) return;
+
+    // Don't trigger anything if dropped back in the same column
+    const currentStatus = project.bid_status || "New Lead";
+    if (currentStatus === targetStatus) {
+      setDraggedProjectId(null);
+      return;
+    }
+
+    setDraggedProjectId(null);
+    handleBidStatusChange(projectId, targetStatus);
+  }
+
   // ── Bid-status change handler ──────────────────────────────────────────
 
   async function handleBidStatusChange(projectId: string, newStatus: BidStatus) {
@@ -1093,7 +1141,7 @@ export default function App() {
   }
 
   return (
-    <div style={{ padding: 40, maxWidth: 1200, color: "black", background: "white" }}>
+    <div style={{ padding: 40, maxWidth: 1400, color: "black", background: "white" }}>
       <style>{`
         @media print {
           body { background: white !important; }
@@ -1136,82 +1184,138 @@ export default function App() {
           New projects auto-create {COMMON_TRADES.length} common construction trades.
         </p>
 
-        <h2>Your Projects</h2>
+        <h2>Bid Board</h2>
         {projects.length === 0 ? (
-          <p>No projects yet.</p>
+          <p>No projects yet. Create one above to get started.</p>
         ) : (
-          <div style={{ display: "grid", gap: 12, marginBottom: 24 }}>
-            {projects.map((project) => {
-              const isSelected = project.id === selectedProjectId;
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: `repeat(${BID_STATUSES.length}, minmax(170px, 1fr))`,
+              gap: 10,
+              marginBottom: 24,
+              overflowX: "auto",
+            }}
+          >
+            {BID_STATUSES.map((status) => {
+              const columnProjects = projects.filter(
+                (p) => (p.bid_status || "New Lead") === status
+              );
+              const isDragOver = dragOverColumn === status;
 
               return (
                 <div
-                  key={project.id}
+                  key={status}
+                  onDragOver={(e) => handleColumnDragOver(e, status)}
+                  onDragLeave={handleColumnDragLeave}
+                  onDrop={(e) => handleColumnDrop(e, status)}
                   style={{
-                    border: isSelected ? "2px solid black" : "1px solid #ccc",
+                    background: isDragOver ? "#e8f5e9" : "#f4f5f7",
                     borderRadius: 8,
-                    padding: 12,
-                    background: isSelected ? "#f5f5f5" : "white",
+                    padding: 10,
+                    minHeight: 200,
+                    border: isDragOver
+                      ? "2px dashed #198754"
+                      : "2px solid transparent",
+                    transition: "background 0.15s, border-color 0.15s",
                   }}
                 >
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <strong>{project.name}</strong>
+                  {/* Column header */}
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      marginBottom: 10,
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: "50%",
+                        background: BID_STATUS_COLORS[status],
+                        flexShrink: 0,
+                      }}
+                    />
+                    <strong style={{ fontSize: 12 }}>{status}</strong>
                     <span
                       style={{
                         fontSize: 11,
-                        padding: "2px 8px",
-                        borderRadius: 4,
-                        color: "white",
-                        backgroundColor:
-                          BID_STATUS_COLORS[
-                            (project.bid_status as BidStatus) || "New Lead"
-                          ],
+                        color: "#888",
+                        marginLeft: "auto",
                       }}
                     >
-                      {project.bid_status || "New Lead"}
+                      {columnProjects.length}
                     </span>
                   </div>
-                  <div style={{ fontSize: 12, marginTop: 6 }}>
-                    Start: {project.start_date || "N/A"}
-                  </div>
-                  <div style={{ fontSize: 12, marginTop: 4 }}>
-                    End: {project.end_date || "N/A"}
-                  </div>
-                  {project.address && (
-                    <div style={{ fontSize: 12, marginTop: 4 }}>
-                      Address: {project.address}
-                    </div>
-                  )}
-                  {project.jobtread_job_number && (
-                    <div style={{ fontSize: 12, marginTop: 4, color: "#198754" }}>
-                      JobTread #{project.jobtread_job_number}
-                    </div>
-                  )}
-                  {project.procore_project_id && (
-                    <div style={{ fontSize: 12, marginTop: 4, color: "#0d6efd" }}>
-                      Procore Project #{project.procore_project_id}
-                    </div>
-                  )}
-                  <div style={{ marginTop: 10, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                    <button onClick={() => setSelectedProjectId(project.id)}>
-                      {isSelected ? "Current Project" : "Open Project"}
-                    </button>
-                    <select
-                      value={project.bid_status || "New Lead"}
-                      onChange={(e) =>
-                        handleBidStatusChange(
-                          project.id,
-                          e.target.value as BidStatus
-                        )
-                      }
-                      style={{ ...inputStyle, padding: 4, fontSize: 12 }}
-                    >
-                      {BID_STATUSES.map((status) => (
-                        <option key={status} value={status}>
-                          {status}
-                        </option>
-                      ))}
-                    </select>
+
+                  {/* Cards */}
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {columnProjects.map((project) => {
+                      const isSelected = project.id === selectedProjectId;
+                      const isDragging = draggedProjectId === project.id;
+
+                      return (
+                        <div
+                          key={project.id}
+                          draggable
+                          onDragStart={(e) => handleDragStart(e, project.id)}
+                          onDragEnd={handleDragEnd}
+                          onClick={() => setSelectedProjectId(project.id)}
+                          style={{
+                            border: isSelected
+                              ? "2px solid #0d6efd"
+                              : "1px solid #ddd",
+                            borderRadius: 6,
+                            padding: 10,
+                            background: isDragging
+                              ? "#e3f2fd"
+                              : isSelected
+                              ? "#f0f7ff"
+                              : "white",
+                            cursor: "grab",
+                            opacity: isDragging ? 0.5 : 1,
+                            fontSize: 12,
+                            transition: "opacity 0.15s, box-shadow 0.15s",
+                            boxShadow: isSelected
+                              ? "0 1px 4px rgba(13,110,253,0.15)"
+                              : "0 1px 2px rgba(0,0,0,0.06)",
+                          }}
+                        >
+                          <strong style={{ fontSize: 13 }}>
+                            {project.name}
+                          </strong>
+                          <div style={{ marginTop: 4, color: "#666" }}>
+                            {project.start_date || "No start"} →{" "}
+                            {project.end_date || "No end"}
+                          </div>
+                          {project.address && (
+                            <div
+                              style={{
+                                marginTop: 3,
+                                color: "#666",
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {project.address}
+                            </div>
+                          )}
+                          {project.jobtread_job_number && (
+                            <div style={{ marginTop: 3, color: "#198754" }}>
+                              JT #{project.jobtread_job_number}
+                            </div>
+                          )}
+                          {project.procore_project_id && (
+                            <div style={{ marginTop: 3, color: "#0d6efd" }}>
+                              Procore #{project.procore_project_id}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               );

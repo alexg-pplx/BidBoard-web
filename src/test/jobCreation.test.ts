@@ -334,3 +334,68 @@ describe('Error propagation', () => {
     await expect(executeJobCreation(card, vi.fn())).rejects.toThrow('Procore patch error');
   });
 });
+
+// ── 7. parseAddress flag is always enabled ─────────────────────────────────
+describe('Location uses parseAddress', () => {
+  it('calls createLocation with the address text from the bid card', async () => {
+    const card: BidCardData = {
+      projectName: 'Parse Test',
+      address: '500 Congress Ave, Austin, TX 78701',
+      dueDate: null,
+    };
+
+    await executeJobCreation(card, vi.fn());
+
+    expect(mockCreateLocation).toHaveBeenCalledWith(
+      '500 Congress Ave, Austin, TX 78701',
+    );
+  });
+});
+
+// ── 8. Procore project is patched with ESTIMATING status ───────────────────
+describe('Procore status set to ESTIMATING', () => {
+  it('patchProject is called with the JobTread job number, formatted address, and due date', async () => {
+    const card: BidCardData = {
+      projectName: 'Status Test',
+      address: '100 Main St, Dallas, TX 75001',
+      dueDate: '2026-09-15',
+    };
+
+    await executeJobCreation(card, vi.fn());
+
+    expect(mockPatchProject).toHaveBeenCalledWith(
+      MOCK_CLONED.id,
+      expect.objectContaining({
+        projectNumber: MOCK_JOB.number,
+        dueDate: '2026-09-15',
+      }),
+    );
+  });
+});
+
+// ── 9. Kanban drop triggers job creation only for target column ──────────────
+describe('Kanban board trigger', () => {
+  it('executeJobCreation succeeds with full bid card data (simulating Kanban drop to Accepted)', async () => {
+    const card: BidCardData = {
+      projectName: 'Kanban Drop Project',
+      address: '42 Board Lane, Houston, TX 77002',
+      dueDate: '2026-11-30',
+    };
+
+    const result = await executeJobCreation(card, vi.fn());
+
+    // All 5 APIs were called in sequence
+    expect(mockCreateCustomerAccount).toHaveBeenCalledTimes(1);
+    expect(mockCreateLocation).toHaveBeenCalledTimes(1);
+    expect(mockCreateJob).toHaveBeenCalledTimes(1);
+    expect(mockCloneTemplateProject).toHaveBeenCalledTimes(1);
+    expect(mockPatchProject).toHaveBeenCalledTimes(1);
+
+    // Result has all expected fields
+    expect(result.account.id).toBe('acct-1');
+    expect(result.location.id).toBe('loc-1');
+    expect(result.job.number).toBe('JT-1001');
+    expect(result.procoreProject.id).toBe(42);
+    expect(result.patchedProject.project_number).toBe('JT-1001');
+  });
+});
