@@ -1,5 +1,37 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "./lib/supabase";
+import {
+  executeJobCreation,
+  type JobCreationProgress,
+  type JobCreationResult,
+  type BidCardData,
+} from "./lib/jobCreation";
+
+type BidStatus =
+  | "New Lead"
+  | "Bidding"
+  | "Accepted / Needs Takeoff"
+  | "In Progress"
+  | "Complete"
+  | "Lost";
+
+const BID_STATUSES: BidStatus[] = [
+  "New Lead",
+  "Bidding",
+  "Accepted / Needs Takeoff",
+  "In Progress",
+  "Complete",
+  "Lost",
+];
+
+const BID_STATUS_COLORS: Record<BidStatus, string> = {
+  "New Lead": "#6c757d",
+  "Bidding": "#0d6efd",
+  "Accepted / Needs Takeoff": "#198754",
+  "In Progress": "#fd7e14",
+  "Complete": "#20c997",
+  "Lost": "#dc3545",
+};
 
 type Project = {
   id: string;
@@ -8,6 +40,11 @@ type Project = {
   end_date: string | null;
   owner_id: string;
   created_at: string;
+  bid_status: BidStatus | null;
+  address: string | null;
+  jobtread_job_id: string | null;
+  jobtread_job_number: string | null;
+  procore_project_id: number | null;
 };
 
 type Trade = {
@@ -128,6 +165,19 @@ export default function App() {
   const [shareRole, setShareRole] = useState<ShareRole>("viewer");
   const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
   const [memberRoleDrafts, setMemberRoleDrafts] = useState<Record<string, ShareRole>>({});
+
+  // ── Job-creation state ───────────────────────────────────────────────
+  const [jobCreationProgress, setJobCreationProgress] =
+    useState<JobCreationProgress | null>(null);
+  const [jobCreationResult, setJobCreationResult] =
+    useState<JobCreationResult | null>(null);
+  const [jobCreationError, setJobCreationError] = useState<string | null>(null);
+  const [showAcceptConfirm, setShowAcceptConfirm] = useState<string | null>(null); // project id awaiting confirmation
+  const [projectAddress, setProjectAddress] = useState(""); // address input for job creation
+
+  // ── Kanban drag-and-drop state ──────────────────────────────────────
+  const [draggedProjectId, setDraggedProjectId] = useState<string | null>(null);
+  const [dragOverColumn, setDragOverColumn] = useState<BidStatus | null>(null);
 
   useEffect(() => {
     async function loadSession() {
@@ -434,6 +484,7 @@ export default function App() {
         start_date: projectStartDate || null,
         end_date: projectEndDate || null,
         owner_id: userId,
+        bid_status: "New Lead",
       })
       .select()
       .single();
@@ -794,6 +845,140 @@ export default function App() {
     window.print();
   }
 
+  // ── Kanban drag-and-drop handlers ────────────────────────────────────────
+
+  function handleDragStart(e: React.DragEvent, projectId: string) {
+    setDraggedProjectId(projectId);
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", projectId);
+  }
+
+  function handleDragEnd() {
+    setDraggedProjectId(null);
+    setDragOverColumn(null);
+  }
+
+  function handleColumnDragOver(e: React.DragEvent, status: BidStatus) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDragOverColumn(status);
+  }
+
+  function handleColumnDragLeave() {
+    setDragOverColumn(null);
+  }
+
+  function handleColumnDrop(e: React.DragEvent, targetStatus: BidStatus) {
+    e.preventDefault();
+    setDragOverColumn(null);
+
+    const projectId = draggedProjectId || e.dataTransfer.getData("text/plain");
+    if (!projectId) return;
+
+    const project = projects.find((p) => p.id === projectId);
+    if (!project) return;
+
+    // Don't trigger anything if dropped back in the same column
+    const currentStatus = project.bid_status || "New Lead";
+    if (currentStatus === targetStatus) {
+      setDraggedProjectId(null);
+      return;
+    }
+
+    setDraggedProjectId(null);
+    handleBidStatusChange(projectId, targetStatus);
+  }
+
+  // ── Bid-status change handler ──────────────────────────────────────────
+
+  async function handleBidStatusChange(projectId: string, newStatus: BidStatus) {
+    // If moving to "Accepted / Needs Takeoff", show confirmation first
+    if (newStatus === "Accepted / Needs Takeoff") {
+      const proj = projects.find((p) => p.id === projectId);
+      setProjectAddress(proj?.address || "");
+      setShowAcceptConfirm(projectId);
+      return;
+    }
+
+    // For all other statuses, update directly
+    const { error } = await supabase
+      .from("projects")
+      .update({ bid_status: newStatus })
+      .eq("id", projectId);
+
+    if (error) {
+      setMessage(`Status update error: ${error.message}`);
+      return;
+    }
+
+    setMessage(`Status changed to "${newStatus}".`);
+    await refreshAllProjects();
+  }
+
+  async function handleAcceptAndCreateJob() {
+    if (!showAcceptConfirm) return;
+
+    const project = projects.find((p) => p.id === showAcceptConfirm);
+    if (!project) {
+      setMessage("Project not found.");
+      setShowAcceptConfirm(null);
+      return;
+    }
+
+    if (!projectAddress.trim()) {
+      setMessage("An address is required for job creation.");
+      return;
+    }
+
+    // Close the dialog immediately
+    const projectId = showAcceptConfirm;
+    setShowAcceptConfirm(null);
+    setJobCreationResult(null);
+    setJobCreationError(null);
+
+    const card: BidCardData = {
+      projectName: project.name,
+      address: projectAddress.trim(),
+      dueDate: project.end_date,
+    };
+
+    try {
+      const result = await executeJobCreation(card, (progress) => {
+        setJobCreationProgress(progress);
+      });
+
+      setJobCreationResult(result);
+      setJobCreationProgress(null);
+
+      // Persist the status + integration IDs back to Supabase
+      const { error: updateError } = await supabase
+        .from("projects")
+        .update({
+          bid_status: "Accepted / Needs Takeoff" as BidStatus,
+          address: projectAddress.trim(),
+          jobtread_job_id: result.job.id,
+          jobtread_job_number: result.job.number,
+          procore_project_id: result.patchedProject.id,
+        })
+        .eq("id", projectId);
+
+      if (updateError) {
+        setMessage(
+          `Job created but status save failed: ${updateError.message}`
+        );
+      } else {
+        setMessage(
+          `Job creation complete. JobTread #${result.job.number}, Procore project #${result.patchedProject.id}.`
+        );
+      }
+
+      await refreshAllProjects();
+    } catch (err: any) {
+      setJobCreationError(err.message || "Unknown error during job creation.");
+      setJobCreationProgress(null);
+    }
+  }
+
   const selectedProject =
     projects.find((project) => project.id === selectedProjectId) || null;
 
@@ -956,7 +1141,7 @@ export default function App() {
   }
 
   return (
-    <div style={{ padding: 40, maxWidth: 1200, color: "black", background: "white" }}>
+    <div style={{ padding: 40, maxWidth: 1400, color: "black", background: "white" }}>
       <style>{`
         @media print {
           body { background: white !important; }
@@ -999,35 +1184,138 @@ export default function App() {
           New projects auto-create {COMMON_TRADES.length} common construction trades.
         </p>
 
-        <h2>Your Projects</h2>
+        <h2>Bid Board</h2>
         {projects.length === 0 ? (
-          <p>No projects yet.</p>
+          <p>No projects yet. Create one above to get started.</p>
         ) : (
-          <div style={{ display: "grid", gap: 12, marginBottom: 24 }}>
-            {projects.map((project) => {
-              const isSelected = project.id === selectedProjectId;
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: `repeat(${BID_STATUSES.length}, minmax(170px, 1fr))`,
+              gap: 10,
+              marginBottom: 24,
+              overflowX: "auto",
+            }}
+          >
+            {BID_STATUSES.map((status) => {
+              const columnProjects = projects.filter(
+                (p) => (p.bid_status || "New Lead") === status
+              );
+              const isDragOver = dragOverColumn === status;
 
               return (
                 <div
-                  key={project.id}
+                  key={status}
+                  onDragOver={(e) => handleColumnDragOver(e, status)}
+                  onDragLeave={handleColumnDragLeave}
+                  onDrop={(e) => handleColumnDrop(e, status)}
                   style={{
-                    border: isSelected ? "2px solid black" : "1px solid #ccc",
+                    background: isDragOver ? "#e8f5e9" : "#f4f5f7",
                     borderRadius: 8,
-                    padding: 12,
-                    background: isSelected ? "#f5f5f5" : "white",
+                    padding: 10,
+                    minHeight: 200,
+                    border: isDragOver
+                      ? "2px dashed #198754"
+                      : "2px solid transparent",
+                    transition: "background 0.15s, border-color 0.15s",
                   }}
                 >
-                  <strong>{project.name}</strong>
-                  <div style={{ fontSize: 12, marginTop: 6 }}>
-                    Start: {project.start_date || "N/A"}
+                  {/* Column header */}
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                      marginBottom: 10,
+                    }}
+                  >
+                    <span
+                      style={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: "50%",
+                        background: BID_STATUS_COLORS[status],
+                        flexShrink: 0,
+                      }}
+                    />
+                    <strong style={{ fontSize: 12 }}>{status}</strong>
+                    <span
+                      style={{
+                        fontSize: 11,
+                        color: "#888",
+                        marginLeft: "auto",
+                      }}
+                    >
+                      {columnProjects.length}
+                    </span>
                   </div>
-                  <div style={{ fontSize: 12, marginTop: 4 }}>
-                    End: {project.end_date || "N/A"}
-                  </div>
-                  <div style={{ marginTop: 10 }}>
-                    <button onClick={() => setSelectedProjectId(project.id)}>
-                      {isSelected ? "Current Project" : "Open Project"}
-                    </button>
+
+                  {/* Cards */}
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {columnProjects.map((project) => {
+                      const isSelected = project.id === selectedProjectId;
+                      const isDragging = draggedProjectId === project.id;
+
+                      return (
+                        <div
+                          key={project.id}
+                          draggable
+                          onDragStart={(e) => handleDragStart(e, project.id)}
+                          onDragEnd={handleDragEnd}
+                          onClick={() => setSelectedProjectId(project.id)}
+                          style={{
+                            border: isSelected
+                              ? "2px solid #0d6efd"
+                              : "1px solid #ddd",
+                            borderRadius: 6,
+                            padding: 10,
+                            background: isDragging
+                              ? "#e3f2fd"
+                              : isSelected
+                              ? "#f0f7ff"
+                              : "white",
+                            cursor: "grab",
+                            opacity: isDragging ? 0.5 : 1,
+                            fontSize: 12,
+                            transition: "opacity 0.15s, box-shadow 0.15s",
+                            boxShadow: isSelected
+                              ? "0 1px 4px rgba(13,110,253,0.15)"
+                              : "0 1px 2px rgba(0,0,0,0.06)",
+                          }}
+                        >
+                          <strong style={{ fontSize: 13 }}>
+                            {project.name}
+                          </strong>
+                          <div style={{ marginTop: 4, color: "#666" }}>
+                            {project.start_date || "No start"} →{" "}
+                            {project.end_date || "No end"}
+                          </div>
+                          {project.address && (
+                            <div
+                              style={{
+                                marginTop: 3,
+                                color: "#666",
+                                whiteSpace: "nowrap",
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {project.address}
+                            </div>
+                          )}
+                          {project.jobtread_job_number && (
+                            <div style={{ marginTop: 3, color: "#198754" }}>
+                              JT #{project.jobtread_job_number}
+                            </div>
+                          )}
+                          {project.procore_project_id && (
+                            <div style={{ marginTop: 3, color: "#0d6efd" }}>
+                              Procore #{project.procore_project_id}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               );
@@ -1050,6 +1338,31 @@ export default function App() {
           <p className="no-print">
             Your access: <strong>{currentUserRole}</strong>
           </p>
+          <p>
+            Status:{" "}
+            <span
+              style={{
+                display: "inline-block",
+                fontSize: 12,
+                padding: "2px 10px",
+                borderRadius: 4,
+                color: "white",
+                backgroundColor:
+                  BID_STATUS_COLORS[
+                    (selectedProject.bid_status as BidStatus) || "New Lead"
+                  ],
+              }}
+            >
+              {selectedProject.bid_status || "New Lead"}
+            </span>
+          </p>
+          {selectedProject.jobtread_job_number && (
+            <p style={{ fontSize: 13 }}>
+              JobTread Job #{selectedProject.jobtread_job_number}
+              {selectedProject.procore_project_id &&
+                ` · Procore Project #${selectedProject.procore_project_id}`}
+            </p>
+          )}
 
           <div className="no-print" style={{ marginBottom: 20 }}>
             <button onClick={handlePrintSummary}>Print Summary</button>
@@ -1575,6 +1888,252 @@ export default function App() {
       )}
 
       <p style={{ marginTop: 20 }} className="no-print">{message}</p>
+
+      {/* ── Confirmation dialog for "Accepted / Needs Takeoff" ─────────── */}
+      {showAcceptConfirm && (
+        <div
+          className="no-print"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1000,
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              borderRadius: 12,
+              padding: 28,
+              maxWidth: 460,
+              width: "90%",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
+            }}
+          >
+            <h3 style={{ marginTop: 0 }}>Accept Bid &amp; Create Job</h3>
+            <p style={{ fontSize: 14, color: "#555" }}>
+              Moving to <strong>"Accepted / Needs Takeoff"</strong> will
+              automatically create a customer account, location, and job in
+              JobTread, then clone and configure a Procore project.
+            </p>
+
+            <label style={{ display: "block", marginTop: 12, fontSize: 13 }}>
+              Project address (required for location parsing):
+            </label>
+            <input
+              type="text"
+              value={projectAddress}
+              onChange={(e) => setProjectAddress(e.target.value)}
+              placeholder="123 Main St, City, ST 12345"
+              style={{ ...inputStyle, padding: 10, width: "100%", marginTop: 4, boxSizing: "border-box" }}
+            />
+
+            <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+              <button
+                onClick={handleAcceptAndCreateJob}
+                style={{
+                  background: "#198754",
+                  color: "white",
+                  border: "none",
+                  padding: "8px 20px",
+                  borderRadius: 6,
+                  cursor: "pointer",
+                }}
+              >
+                Confirm &amp; Create Job
+              </button>
+              <button
+                onClick={() => setShowAcceptConfirm(null)}
+                style={{
+                  background: "#6c757d",
+                  color: "white",
+                  border: "none",
+                  padding: "8px 20px",
+                  borderRadius: 6,
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Job-creation progress overlay ─────────────────────────────── */}
+      {jobCreationProgress && (
+        <div
+          className="no-print"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1001,
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              borderRadius: 12,
+              padding: 28,
+              maxWidth: 460,
+              width: "90%",
+              textAlign: "center",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
+            }}
+          >
+            <h3 style={{ marginTop: 0 }}>Creating Job…</h3>
+            <p style={{ fontSize: 14, color: "#555" }}>
+              {jobCreationProgress.message}
+            </p>
+            <div
+              style={{
+                height: 4,
+                background: "#e9ecef",
+                borderRadius: 2,
+                marginTop: 16,
+                overflow: "hidden",
+              }}
+            >
+              <div
+                style={{
+                  height: "100%",
+                  background: "#198754",
+                  borderRadius: 2,
+                  transition: "width 0.3s",
+                  width:
+                    jobCreationProgress.step === "creating_customer"
+                      ? "20%"
+                      : jobCreationProgress.step === "creating_location"
+                      ? "40%"
+                      : jobCreationProgress.step === "creating_job"
+                      ? "60%"
+                      : jobCreationProgress.step === "cloning_procore_project"
+                      ? "80%"
+                      : jobCreationProgress.step === "patching_procore_project"
+                      ? "90%"
+                      : "100%",
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Job-creation result ────────────────────────────────────── */}
+      {jobCreationResult && (
+        <div
+          className="no-print"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1001,
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              borderRadius: 12,
+              padding: 28,
+              maxWidth: 500,
+              width: "90%",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
+            }}
+          >
+            <h3 style={{ marginTop: 0, color: "#198754" }}>Job Created Successfully</h3>
+            <table style={{ width: "100%", fontSize: 13 }}>
+              <tbody>
+                <tr>
+                  <td style={{ padding: 4, fontWeight: "bold" }}>JobTread Customer</td>
+                  <td style={{ padding: 4 }}>{jobCreationResult.account.name} ({jobCreationResult.account.id})</td>
+                </tr>
+                <tr>
+                  <td style={{ padding: 4, fontWeight: "bold" }}>JobTread Location</td>
+                  <td style={{ padding: 4 }}>{jobCreationResult.location.name}</td>
+                </tr>
+                <tr>
+                  <td style={{ padding: 4, fontWeight: "bold" }}>JobTread Job #</td>
+                  <td style={{ padding: 4 }}>{jobCreationResult.job.number} — {jobCreationResult.job.name}</td>
+                </tr>
+                <tr>
+                  <td style={{ padding: 4, fontWeight: "bold" }}>Procore Project</td>
+                  <td style={{ padding: 4 }}>#{jobCreationResult.patchedProject.id} — {jobCreationResult.patchedProject.name}</td>
+                </tr>
+              </tbody>
+            </table>
+            <button
+              onClick={() => setJobCreationResult(null)}
+              style={{
+                marginTop: 16,
+                background: "#198754",
+                color: "white",
+                border: "none",
+                padding: "8px 20px",
+                borderRadius: 6,
+                cursor: "pointer",
+              }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Job-creation error ─────────────────────────────────────── */}
+      {jobCreationError && (
+        <div
+          className="no-print"
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 1001,
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              borderRadius: 12,
+              padding: 28,
+              maxWidth: 460,
+              width: "90%",
+              boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
+            }}
+          >
+            <h3 style={{ marginTop: 0, color: "#dc3545" }}>Job Creation Failed</h3>
+            <p style={{ fontSize: 14, color: "#555", wordBreak: "break-word" }}>
+              {jobCreationError}
+            </p>
+            <button
+              onClick={() => setJobCreationError(null)}
+              style={{
+                marginTop: 12,
+                background: "#dc3545",
+                color: "white",
+                border: "none",
+                padding: "8px 20px",
+                borderRadius: 6,
+                cursor: "pointer",
+              }}
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
